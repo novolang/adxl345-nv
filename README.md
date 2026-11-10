@@ -67,16 +67,18 @@ novo build --target=frdm-mcxn947 tests/device_read.nv
 
 | Board | Flash | Of which the program | RAM at start |
 |---|---|---|---|
-| nRF52840 DK | 13,080 bytes | 1,366 bytes | 2,660 bytes |
-| nRF54LM20 DK | 13,928 bytes | 1,420 bytes | 2,644 bytes |
-| FRDM-MCXN947 | 22,352 bytes | 6,890 bytes | 2,748 bytes |
+| nRF52840 DK | 19,720 bytes | 4,674 bytes | 3,252 bytes |
+| nRF54LM20 DK | 20,680 bytes | 4,840 bytes | 3,236 bytes |
+| FRDM-MCXN947 | 22,008 bytes | 6,680 bytes | 2,748 bytes |
 
-The two Nordic board packages answer for I2C and SPI as absent hardware,
-so the build removes the code that follows the first bus read, and their
-rows are the image without the driver's reading path.  The novo-lang
-repository tracks the missing Nordic I2C driver as a feature.  The FRDM-MCXN947 board
-package drives I2C and SPI, and its row is the image with the driver's
-code in it.  The rest of each image is the runtime, the compiler's support
+The Nordic DKs drive I2C with a TWIM (the nRF52840 DK's TWIM0 on SDA P0.26
+and SCL P0.27, the nRF54LM20 DK's TWIM22 on SDA P1.03 and SCL P1.04) and SPI
+with a SPIM, on the pins `docs/hal/README.md` names under "The Nordic DKs'
+buses", so the three rows are the image with the driver's code in it.
+Before the Nordic buses landed the two DK rows were 13,080 and 13,928
+bytes, the image without the driver's reading path, because the board
+packages answered for I2C and SPI as absent hardware.  A reply from the part
+over a DK's bus is NOT VERIFIED until the driver rig carries one.  The rest of each image is the runtime, the compiler's support
 library and tables.  The driver's own code allocates nothing: every buffer
 is a fixed-size `Vec` in the caller's frame.
 

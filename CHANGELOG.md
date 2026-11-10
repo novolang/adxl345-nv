@@ -35,8 +35,9 @@ accelerometer on an I2C or an SPI bus.
 - The data sheet read is Rev. E (June 2015), the revision that could be
   fetched.  Later revisions exist and should be read against it.
 - The device program builds for the nRF52840 DK and the nRF54LM20 DK, whose
-  board packages answer for I2C and SPI as absent hardware: on those images
-  `begin` answers `false` until the boards drive the buses.  The gap is
-  tracked by `features/embedded-devex/nordic-twim-i2c-driver.md`.
+  TWIM and SPIM drivers carry the reading path into the image: 19,720 and
+  20,680 bytes of flash.  Before the Nordic buses landed the images were 13,080
+  and 13,928 bytes, without the reading path.  A reply from the part over a
+  DK's bus is NOT VERIFIED.
 - The SPI three-wire mode, the offset registers, the sleep modes and the
   FIFO's trigger mode are not implemented.

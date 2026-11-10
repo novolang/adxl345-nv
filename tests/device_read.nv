@@ -1,0 +1,49 @@
+// device_read — a reading loop for an ADXL345 on a breakout, for an nRF52840
+// DK or an nRF54LM20 DK.
+//
+// The breakout's SDA and SCL go to the board's I2C pins and its SDO/ALT
+// ADDRESS pin to ground, which puts the part at 0x53; its CS pin goes to
+// the supply, which selects I2C; INT1 goes to a free GPIO, if the program
+// is to read the data-ready line.  The program waits the 11 ms the part
+// takes to turn on, brings it up at ±2 g in full resolution at 100 Hz,
+// and prints one line per sample over RTT:
+//
+//     adxl345 x=<milli-g> y=<milli-g> z=<milli-g>
+//
+// With the board flat and face up, z is close to 1000.
+//
+// Build it with `novo build --target=nrf52840-dk tests/device_read.nv` or
+// `novo build --target=nrf54lm20-dk tests/device_read.nv`.
+
+use embedded_hal.{ BoardI2c, BoardGpio }
+use dev_bus
+use dev_accel.{ AccelMilliG, Accelerometer }
+use adxl345
+use adxl345.{ Adxl345 }
+
+// The part's address with the ALT ADDRESS pin low.
+const ADDR = 0x53
+
+// A label and a number, written without building a string.
+fn field(label: Str, v: Int) [hw]
+    hal.uart.write(label)
+    hal.uart.write(str.from_int(v))
+
+@tier(embedded)
+fn main() [hw]
+    let part = Adxl345.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, ADDR))
+    hal.timer.delay_ms(2)
+    if not part.begin()
+        hal.uart.write("adxl345: no answer\n")
+        return
+    hal.timer.delay_ms(12)
+    loop
+        match part.accel_read_new()
+            Some(a) =>
+                hal.uart.write("adxl345")
+                field(" x=", a.x)
+                field(" y=", a.y)
+                field(" z=", a.z)
+                hal.uart.write("\n")
+            None =>
+                hal.timer.delay_ms(2)

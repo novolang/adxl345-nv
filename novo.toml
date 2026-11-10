@@ -1,0 +1,23 @@
+[package]
+name        = "adxl345-nv"
+version     = "0.1.0"
+description = "A driver for Analog Devices' ADXL345 three-axis accelerometer on an I2C or an SPI bus: the acceleration in milli-g, the four ranges with full resolution and the justify bit, the output data rates and low-power mode, the data-ready line, the FIFO as an option, the tap, activity, inactivity and free-fall detectors as configuration, the self-test and DEVID, as devices-nv's Accelerometer and Identifiable."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["adxl345", "accelerometer", "i2c", "spi", "sensor", "tap", "free-fall", "nrf52840-dk", "nrf54lm20-dk"]
+repository  = "https://github.com/novolang/adxl345-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.0"
+
+[docs.pages]
+"README.md" = "Reading an ADXL345 accelerometer from a device program"
+
+[dependencies]
+# The board's I2C bus, SPI bus and GPIO handles, and the I2cBus, SpiBus
+# and GpioOut traits they implement.
+embedded-hal-nv = "^0.3.2"
+# The wiring record a board's device table hands `attach`, the register
+# helpers, and the Accelerometer and Identifiable traits.
+devices-nv      = "^0.3.2"

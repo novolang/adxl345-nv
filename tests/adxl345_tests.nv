@@ -1,0 +1,1364 @@
+// adxl345_tests — the driver over a double of the part: a register file
+// that answers on an I2C bus and on an SPI bus the way Analog Devices'
+// data sheet (D07925-0-6/15(E), Rev. E, pp. 15 to 17) says an ADXL345
+// does, so the command byte, the multiple-byte bit, DEVID, every
+// conversion, the FIFO, the detectors, the interrupt pins, the
+// self-test and the bring-up are checked on the host, one transaction at
+// a time.  The log keeps what the controller sent, in a form the tests
+// compare.
+//
+// Log entries: an I2C write is 1, the address, the bytes sent, -1; an I2C
+// read is 2, the address, the register, the count, -1; an SPI
+// transaction is 3, the bytes the controller clocked out, -1.
+
+use std.test
+use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, I2cBus, SpiBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_accel.{ AccelMilliG, AccelRange, Accelerometer }
+use dev_id.{ DeviceId, Identifiable }
+use adxl345
+use adxl345.{ Adxl345, Adxl345Spi, Adxl345Port }
+
+// ── The double ───────────────────────────────────────────────────────
+//
+// `regs` is the part's registers.  `st` is the double's state: 0 is 0
+// before an SPI command byte and 1 after it, 1 the register, 2 R/W, 3 MB,
+// 4 1 when a part is there, 9 1 inside an SPI transaction, 10 the number
+// of FIFO samples taken, 20 and 21 the SPI clock and mode, 22 the I2C
+// clock, 30 to 32 the counts the self-test adds to X, Y and Z, 40 the
+// latched flags of INT_SOURCE other than DATA_READY, 41 DATA_READY, 42 1
+// when a sample is ready whenever INT_SOURCE is read, 44 and 45 the grants
+// of that readiness when 45 is 1, 98 the bytes in the FIFO and 99 the
+// entries in the log.  `ro` lists registers that ignore a write.  `fifo`
+// holds the FIFO's samples as six bytes each, and `log` the log.
+// Everything is kept in maps, which a method changes through its
+// receiver.
+
+struct Chip
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    ro: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+    fifo: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+// The chip with DEVID and the reset values in place.
+fn chip() -> Chip
+    let c = Chip { regs: HashMap.new(), st: HashMap.new(), ro: HashMap.new(), log: HashMap.new(), fifo: HashMap.new() }
+    c.regs.insert(0x00, 0xE5)
+    c.regs.insert(0x2C, 0x0A)
+    c.st.insert(4, 1)
+    c
+
+// Appends a value to the log.
+fn log_push(c: Chip, v: Int)
+    let n = at(c.st, 99)
+    c.log.insert(n, v)
+    c.st.insert(99, n + 1)
+
+// Empties the log.
+fn log_clear(c: Chip)
+    c.st.insert(99, 0)
+
+// The FIFO is on in any mode but bypass.
+fn fifo_on(c: Chip) -> Bool
+    (at(c.regs, 0x38) >> 6) != 0
+
+// The samples in the FIFO that have not been taken.
+fn fifo_left(c: Chip) -> Int
+    at(c.st, 98) / 6 - at(c.st, 10)
+
+// The data register `reg` (0x32 to 0x37) as the part answers it: the
+// FIFO's oldest sample when the FIFO is on, the output registers
+// otherwise, with the self-test's push added to the count when DATA_FORMAT
+// asks for it.  Reading the last register takes the sample out of the
+// FIFO, and any read clears DATA_READY.
+fn data_read(c: Chip, reg: Int) -> Int
+    c.st.insert(41, 0)
+    let axis = (reg - 0x32) / 2
+    let lo = 0x32 + axis * 2
+    var raw = at(c.regs, lo) | (at(c.regs, lo + 1) << 8)
+    if fifo_on(c)
+        let head = at(c.st, 10)
+        if fifo_left(c) > 0
+            let k = head * 6 + axis * 2
+            raw = at(c.fifo, k) | (at(c.fifo, k + 1) << 8)
+        else
+            raw = 0
+        if reg == 0x37 and fifo_left(c) > 0
+            c.st.insert(10, head + 1)
+    if (at(c.regs, 0x31) & 0x80) != 0
+        raw = raw + at(c.st, 30 + axis)
+    if (reg - 0x32) % 2 == 0
+        return raw & 0xFF
+    (raw >> 8) & 0xFF
+
+// INT_SOURCE as the part answers it, which clears the latched flags.
+fn int_source_read(c: Chip) -> Int
+    if at(c.st, 42) == 1
+        if at(c.st, 45) == 0
+            c.st.insert(41, 1)
+        elif at(c.st, 44) > 0
+            c.st.insert(44, at(c.st, 44) - 1)
+            c.st.insert(41, 1)
+    var v = at(c.st, 40)
+    if at(c.st, 41) == 1
+        v = v | 0x80
+    c.st.insert(40, 0)
+    v
+
+// A register as the part answers it.
+fn chip_read(c: Chip, reg: Int) -> Int
+    if reg == 0x30
+        return int_source_read(c)
+    if reg == 0x39
+        if fifo_on(c)
+            return fifo_left(c)
+        return 0
+    if reg >= 0x32 and reg <= 0x37
+        return data_read(c, reg)
+    at(c.regs, reg)
+
+// A write to a register, which a read-only one ignores; a FIFO put in
+// bypass is emptied.
+fn chip_write(c: Chip, reg: Int, v: Int)
+    if at(c.ro, reg) == 1
+        return
+    c.regs.insert(reg, v & 0xFF)
+    if reg == 0x38 and (v >> 6) == 0
+        c.st.insert(10, at(c.st, 98) / 6)
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(22, freq)
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        log_push(self.c, 1)
+        log_push(self.c, addr)
+        for b in data
+            log_push(self.c, b as Int)
+        log_push(self.c, -1)
+        if addr != 0x53 or at(self.c.st, 4) == 0 or data.len() < 2
+            return false
+        var r = data[0] as Int
+        for i in 1..data.len()
+            chip_write(self.c, r, data[i] as Int)
+            r = r + 1
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        log_push(self.c, 2)
+        log_push(self.c, addr)
+        log_push(self.c, tx[0] as Int)
+        log_push(self.c, n)
+        log_push(self.c, -1)
+        if addr != 0x53 or at(self.c.st, 4) == 0
+            return None
+        var r = tx[0] as Int
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, chip_read(self.c, r) as u8)
+            r = r + 1
+        Some(out)
+
+struct FakeSpi
+    c: Chip
+
+impl SpiBus for FakeSpi
+    fn init(self, freq: Int, mode: Int) [hw]
+        self.c.st.insert(20, freq)
+        self.c.st.insert(21, mode)
+
+    fn transfer(self, b: Int) -> Int [hw]
+        if at(self.c.st, 9) == 1
+            log_push(self.c, b)
+        if at(self.c.st, 4) == 0
+            return 0xFF
+        if at(self.c.st, 0) == 0
+            self.c.st.insert(0, 1)
+            self.c.st.insert(1, b & 0x3F)
+            self.c.st.insert(2, (b >> 7) & 1)
+            self.c.st.insert(3, (b >> 6) & 1)
+            return 0xFF
+        let r = at(self.c.st, 1)
+        if at(self.c.st, 3) == 1
+            self.c.st.insert(1, (r + 1) & 0x3F)
+        if at(self.c.st, 2) == 1
+            return chip_read(self.c, r)
+        chip_write(self.c, r, b)
+        0xFF
+
+    fn write(self, data: [u8]) [hw]
+        for b in data
+            let _ = self.transfer(b as Int)
+
+    fn read(self, n: Int) -> [u8] [hw]
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, self.transfer(0xFF) as u8)
+        out
+
+// The GPIO double: the chip select (pin 67) falling starts an SPI
+// transaction and rising ends it.
+struct FakePins
+    c: Chip
+    levels: HashMap<Int, Int>
+    modes: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.modes.insert(pin, dir)
+
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+        if pin == 67 and val == 0
+            self.c.st.insert(0, 0)
+            self.c.st.insert(9, 1)
+            log_push(self.c, 3)
+        if pin == 67 and val == 1 and at(self.c.st, 9) == 1
+            self.c.st.insert(9, 0)
+            log_push(self.c, -1)
+
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+fn pins(c: Chip) -> FakePins
+    FakePins { c: c, levels: HashMap.new(), modes: HashMap.new() }
+
+// The two ports, as a type that holds a bus implements them: every method
+// is the package's own function over the double.
+struct I2cDut
+    bus: FakeI2c
+    pins: FakePins
+    w: DeviceWiring
+
+impl Adxl345Port for I2cDut
+    fn setup(self) -> Bool [hw]
+        adxl345.i2c_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        adxl345.i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        adxl345.i2c_write(self.bus, self.w, reg, v)
+
+    fn irq_level(self) -> Int [hw]
+        adxl345.irq_level_of(self.pins, self.w)
+
+struct SpiDut
+    bus: FakeSpi
+    pins: FakePins
+    w: DeviceWiring
+
+impl Adxl345Port for SpiDut
+    fn setup(self) -> Bool [hw]
+        adxl345.spi_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        adxl345.spi_read_into(self.bus, self.pins, self.w, reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        adxl345.spi_write(self.bus, self.pins, self.w, reg, v)
+
+    fn irq_level(self) -> Int [hw]
+        adxl345.irq_level_of(self.pins, self.w)
+
+// A port that fails one chosen write of a chosen register: `fail` maps a
+// register to the number of the write, counted from 1, that the bus
+// refuses, and `seen` counts the writes.  It reaches the refusals that a
+// read-only register cannot, such as the second write of a register.
+// `reads` limits the data reads to the number in key 0 when key 1 is 1,
+// and refuses a one-byte read of DATA_FORMAT when key 2 is 1.
+struct Flaky
+    inner: I2cDut
+    fail: HashMap<Int, Int>
+    seen: HashMap<Int, Int>
+    reads: HashMap<Int, Int>
+
+impl Adxl345Port for Flaky
+    fn setup(self) -> Bool [hw]
+        self.inner.setup()
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        if reg == 0x31 and n == 1 and at(self.reads, 2) == 1
+            dst.clear()
+            return false
+        if ((reg == 0x32 and n == 6) or (reg == 0x31 and n == 7)) and at(self.reads, 1) == 1
+            if at(self.reads, 0) == 0
+                dst.clear()
+                return false
+            self.reads.insert(0, at(self.reads, 0) - 1)
+        self.inner.read_regs(reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        let n = at(self.seen, reg) + 1
+        self.seen.insert(reg, n)
+        if at(self.fail, reg) == n
+            return false
+        self.inner.write_reg(reg, v)
+
+    fn irq_level(self) -> Int [hw]
+        self.inner.irq_level()
+
+fn flaky(c: Chip, reg: Int, nth: Int) -> Flaky
+    let f = Flaky { inner: i2c_dut(c), fail: HashMap.new(), seen: HashMap.new(), reads: HashMap.new() }
+    f.fail.insert(reg, nth)
+    f
+
+// The board's wiring: the part at 0x53 on I2C, INT1 on pin 65.
+fn i2c_wiring() -> DeviceWiring
+    dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x53), 65)
+
+// The part on SPI: chip select on pin 67, INT1 on pin 65.
+fn spi_wiring() -> DeviceWiring
+    dev_bus.wiring_irq(dev_bus.wiring_spi(0, 67), 65)
+
+fn i2c_dut(c: Chip) -> I2cDut
+    I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: i2c_wiring() }
+
+fn spi_dut(c: Chip) -> SpiDut
+    SpiDut { bus: FakeSpi { c: c }, pins: pins(c), w: spi_wiring() }
+
+// Asserts the log holds exactly `want`, then empties it.
+fn log_is(c: Chip, want: [Int])
+    test.assert_eq(at(c.st, 99), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.log, i), want[i])
+    log_clear(c)
+
+fn reg_of(c: Chip, r: Int) -> Int
+    at(c.regs, r)
+
+// Sets the 16-bit count of an axis, low byte first, at `reg`.
+fn put16(c: Chip, reg: Int, v: Int)
+    let u = v & 0xFFFF
+    c.regs.insert(reg, u & 0xFF)
+    c.regs.insert(reg + 1, u >> 8)
+
+// Sets the three axes' raw 16-bit words.
+fn put_raw(c: Chip, x: Int, y: Int, z: Int)
+    put16(c, 0x32, x)
+    put16(c, 0x34, y)
+    put16(c, 0x36, z)
+
+// Appends a byte to the FIFO.
+fn fifo_put(c: Chip, v: Int)
+    let n = at(c.st, 98)
+    c.fifo.insert(n, v)
+    c.st.insert(98, n + 1)
+
+// A FIFO sample of three raw 16-bit words.
+fn fifo_push(c: Chip, x: Int, y: Int, z: Int)
+    for v in [x, y, z]
+        let u = v & 0xFFFF
+        fifo_put(c, u & 0xFF)
+        fifo_put(c, u >> 8)
+
+fn x_of(o: ?AccelMilliG) -> Int
+    match o
+        Some(a) => a.x
+        None    => -99999
+
+fn y_of(o: ?AccelMilliG) -> Int
+    match o
+        Some(a) => a.y
+        None    => -99999
+
+fn z_of(o: ?AccelMilliG) -> Int
+    match o
+        Some(a) => a.z
+        None    => -99999
+
+// The log of an SPI read: the command, then `n` bytes of 0xFF, which is
+// what the controller clocks out while it reads.
+fn spi_read_log(cmd: Int, n: Int) -> [Int]
+    var out: [Int] = [3, cmd]
+    for _i in 0..n
+        list.push(out, 0xFF)
+    list.push(out, -1)
+    out
+
+// ── The two buses' framing ───────────────────────────────────────────
+
+@test
+fn test_an_i2c_read_is_the_register_and_a_repeated_start_for_any_count() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(adxl345.reg_read(d, 0x00) ?? -1, 0xE5)
+    log_is(c, [2, 0x53, 0x00, 1, -1])
+    c.regs.insert(0x2C, 11)
+    c.regs.insert(0x2D, 22)
+    var b: DevBytes = Vec.new()
+    test.assert(d.read_regs(0x2C, 2, var b))
+    // The register address advances on I2C without a bit of its own.
+    log_is(c, [2, 0x53, 0x2C, 2, -1])
+    test.assert_eq(b[0] as Int, 11)
+    test.assert_eq(b[1] as Int, 22)
+
+@test
+fn test_an_i2c_write_is_the_register_then_the_byte() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(d.write_reg(0x2C, 0x0B))
+    log_is(c, [1, 0x53, 0x2C, 0x0B, -1])
+    test.assert_eq(reg_of(c, 0x2C), 0x0B)
+
+@test
+fn test_a_missing_i2c_part_does_not_answer() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = i2c_dut(c)
+    test.assert(adxl345.reg_read(d, 0x00) == None)
+    test.assert(not d.write_reg(0x2C, 1))
+    test.assert(not adxl345.reg_write(d, 0x2C, 1))
+    test.assert(not adxl345.reg_update(d, 0x2C, 1, 1))
+    test.assert(adxl345.id_read(d) == None)
+
+@test
+fn test_an_spi_read_sets_rw_and_one_register_does_not_set_mb() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert_eq(adxl345.reg_read(d, 0x00) ?? -1, 0xE5)
+    log_is(c, [3, 0x80, 0xFF, -1])
+    test.assert_eq(at(d.pins.levels, 67), 1)
+
+@test
+fn test_an_spi_read_of_a_run_sets_rw_and_mb() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    c.regs.insert(0x2C, 11)
+    c.regs.insert(0x2D, 22)
+    c.regs.insert(0x2E, 33)
+    var b: DevBytes = Vec.new()
+    test.assert(d.read_regs(0x2C, 3, var b))
+    log_is(c, [3, 0xEC, 0xFF, 0xFF, 0xFF, -1])
+    test.assert_eq(b[0] as Int, 11)
+    test.assert_eq(b[1] as Int, 22)
+    test.assert_eq(b[2] as Int, 33)
+
+@test
+fn test_an_spi_write_clears_rw_and_mb() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert(d.write_reg(0x2C, 0x0B))
+    log_is(c, [3, 0x2C, 0x0B, -1])
+    test.assert_eq(reg_of(c, 0x2C), 0x0B)
+
+@test
+fn test_an_spi_part_that_is_not_there_reads_0xff_and_is_no_part() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = spi_dut(c)
+    test.assert_eq(adxl345.reg_read(d, 0x00) ?? -1, 0xFF)
+    test.assert(adxl345.id_read(d) == None)
+    c.st.insert(4, 1)
+    c.regs.insert(0x00, 0)
+    test.assert(adxl345.id_read(d) == None)
+
+@test
+fn test_a_wiring_with_no_chip_select_runs_no_spi_transaction() [io, hw]
+    let c = chip()
+    let d = SpiDut { bus: FakeSpi { c: c }, pins: pins(c), w: dev_bus.wiring_i2c(0, 0x53) }
+    var b: DevBytes = Vec.new()
+    test.assert(not d.read_regs(0x00, 1, var b))
+    test.assert(not d.write_reg(0x2C, 1))
+    test.assert(not d.setup())
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_a_wiring_with_no_address_is_not_an_i2c_part() [io, hw]
+    let c = chip()
+    let d = I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: dev_bus.wiring_spi(0, 67) }
+    test.assert(not d.setup())
+    test.assert_eq(at(c.st, 99), 0)
+
+// ── Setup ────────────────────────────────────────────────────────────
+
+@test
+fn test_i2c_setup_makes_the_interrupt_pin_an_input_and_the_bus_fast() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(d.setup())
+    test.assert_eq(at(c.st, 22), 400000)
+    test.assert_eq(at(d.pins.modes, 65), 0)
+
+@test
+fn test_spi_setup_drives_chip_select_high_before_it_is_an_output() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert(d.setup())
+    test.assert_eq(at(d.pins.levels, 67), 1)
+    test.assert_eq(at(d.pins.modes, 67), 1)
+    test.assert_eq(at(d.pins.modes, 65), 0)
+    test.assert_eq(at(c.st, 20), 4000000)
+    test.assert_eq(at(c.st, 21), 3)
+
+@test
+fn test_the_interrupt_line_level() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    d.pins.levels.insert(65, 1)
+    test.assert_eq(d.irq_level(), 1)
+    test.assert_eq(adxl345.irq_level_of(d.pins, dev_bus.wiring_i2c(0, 0x53)), -1)
+    let s = spi_dut(c)
+    s.pins.levels.insert(65, 1)
+    test.assert_eq(s.irq_level(), 1)
+
+// ── Identity ─────────────────────────────────────────────────────────
+
+@test
+fn test_the_identity_is_devid_on_both_buses() [io, hw]
+    let c = chip()
+    match adxl345.id_read(i2c_dut(c))
+        Some(id) =>
+            test.assert_eq(id.who, 0xE5)
+            test.assert(id.rev == None)
+        None => test.assert(false)
+    match adxl345.id_read(spi_dut(c))
+        Some(id) => test.assert_eq(id.who, 0xE5)
+        None     => test.assert(false)
+
+// ── The conversions ──────────────────────────────────────────────────
+
+@test
+fn test_the_range_bits_round_trip() [io, hw]
+    test.assert(adxl345.range_of_format(0x00) == AccelRange2g)
+    test.assert(adxl345.range_of_format(0x01) == AccelRange4g)
+    test.assert(adxl345.range_of_format(0x02) == AccelRange8g)
+    test.assert(adxl345.range_of_format(0x0B) == AccelRange16g)
+    test.assert_eq(adxl345.bits_of_range(AccelRange2g), 0)
+    test.assert_eq(adxl345.bits_of_range(AccelRange4g), 1)
+    test.assert_eq(adxl345.bits_of_range(AccelRange8g), 2)
+    test.assert_eq(adxl345.bits_of_range(AccelRange16g), 3)
+
+@test
+fn test_the_valid_bits_follow_full_res_and_the_range() [io, hw]
+    // Table 1: 10 bits in the fixed mode at every range, and 10 to 13 in
+    // full resolution.
+    test.assert_eq(adxl345.bits_of_format(0x00), 10)
+    test.assert_eq(adxl345.bits_of_format(0x03), 10)
+    test.assert_eq(adxl345.bits_of_format(0x08), 10)
+    test.assert_eq(adxl345.bits_of_format(0x09), 11)
+    test.assert_eq(adxl345.bits_of_format(0x0A), 12)
+    test.assert_eq(adxl345.bits_of_format(0x0B), 13)
+
+@test
+fn test_one_g_is_256_counts_in_every_range_in_full_resolution() [io, hw]
+    // Full resolution keeps 256 counts per g (3.9 mg) at every range.
+    let c = chip()
+    let d = i2c_dut(c)
+    put_raw(c, 256, -256, 128)
+    for fmt in [0x08, 0x09, 0x0A, 0x0B]
+        c.regs.insert(0x31, fmt)
+        let s = adxl345.sample_read(d)
+        test.assert_eq(x_of(s), 1000)
+        test.assert_eq(y_of(s), -1000)
+        test.assert_eq(z_of(s), 500)
+
+@test
+fn test_one_g_is_256_128_64_and_32_counts_in_the_fixed_mode() [io, hw]
+    // Table 1: 256, 128, 64 and 32 LSB/g at ±2, ±4, ±8 and ±16 g, 10 bits.
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x31, 0x00)
+    put_raw(c, 256, -256, 1)
+    test.assert_eq(x_of(adxl345.sample_read(d)), 1000)
+    test.assert_eq(y_of(adxl345.sample_read(d)), -1000)
+    // One count at ±2 g is 2000 / 512 = 3.9 mg, truncated to 3.
+    test.assert_eq(z_of(adxl345.sample_read(d)), 3)
+    c.regs.insert(0x31, 0x01)
+    put_raw(c, 128, -128, 0)
+    test.assert_eq(x_of(adxl345.sample_read(d)), 1000)
+    test.assert_eq(y_of(adxl345.sample_read(d)), -1000)
+    c.regs.insert(0x31, 0x02)
+    put_raw(c, 64, -64, 0)
+    test.assert_eq(x_of(adxl345.sample_read(d)), 1000)
+    c.regs.insert(0x31, 0x03)
+    put_raw(c, 32, -32, 0)
+    test.assert_eq(x_of(adxl345.sample_read(d)), 1000)
+    test.assert_eq(y_of(adxl345.sample_read(d)), -1000)
+
+@test
+fn test_the_largest_counts_reach_the_full_scale_at_each_resolution() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    // 13 bits at ±16 g: +4095 and -4096 counts.
+    c.regs.insert(0x31, 0x0B)
+    put_raw(c, 4095, -4096, 0)
+    test.assert_eq(x_of(adxl345.sample_read(d)), 15996)
+    test.assert_eq(y_of(adxl345.sample_read(d)), -16000)
+    // 10 bits at ±2 g: +511 and -512 counts.
+    c.regs.insert(0x31, 0x00)
+    put_raw(c, 511, -512, 0)
+    test.assert_eq(x_of(adxl345.sample_read(d)), 1996)
+    test.assert_eq(y_of(adxl345.sample_read(d)), -2000)
+
+@test
+fn test_a_left_justified_count_is_shifted_down_to_its_valid_bits() [io, hw]
+    // Justify set: the count sits at the top of the 16 bits.  13 bits at
+    // ±16 g shift by 3, 10 bits by 6.
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x31, 0x0F)
+    put_raw(c, 256 << 3, -256 << 3, 0)
+    test.assert_eq(x_of(adxl345.sample_read(d)), 1000)
+    test.assert_eq(y_of(adxl345.sample_read(d)), -1000)
+    c.regs.insert(0x31, 0x04)
+    put_raw(c, 256 << 6, -256 << 6, 0)
+    test.assert_eq(x_of(adxl345.sample_read(d)), 1000)
+    test.assert_eq(y_of(adxl345.sample_read(d)), -1000)
+    // The same word read as right-justified is a wrong value, which is why
+    // the format travels with the sample.
+    c.regs.insert(0x31, 0x00)
+    put_raw(c, 256 << 6, 0, 0)
+    test.assert(x_of(adxl345.sample_read(d)) != 1000)
+
+@test
+fn test_the_rate_codes_halve_from_3200_hz_to_a_tenth() [io, hw]
+    // Table 7: 3200 Hz at 1111, half for each code below.
+    test.assert_eq(adxl345.rate_mhz_of_code(15), 3200000)
+    test.assert_eq(adxl345.rate_mhz_of_code(14), 1600000)
+    test.assert_eq(adxl345.rate_mhz_of_code(13), 800000)
+    test.assert_eq(adxl345.rate_mhz_of_code(12), 400000)
+    test.assert_eq(adxl345.rate_mhz_of_code(11), 200000)
+    test.assert_eq(adxl345.rate_mhz_of_code(10), 100000)
+    test.assert_eq(adxl345.rate_mhz_of_code(9), 50000)
+    test.assert_eq(adxl345.rate_mhz_of_code(8), 25000)
+    test.assert_eq(adxl345.rate_mhz_of_code(7), 12500)
+    test.assert_eq(adxl345.rate_mhz_of_code(6), 6250)
+    test.assert_eq(adxl345.rate_mhz_of_code(5), 3125)
+    test.assert_eq(adxl345.rate_mhz_of_code(4), 1563)
+    test.assert_eq(adxl345.rate_mhz_of_code(3), 781)
+    test.assert_eq(adxl345.rate_mhz_of_code(2), 391)
+    test.assert_eq(adxl345.rate_mhz_of_code(1), 195)
+    test.assert_eq(adxl345.rate_mhz_of_code(0), 98)
+    // Only the code's four bits count.
+    test.assert_eq(adxl345.rate_mhz_of_code(0x1A), 100000)
+
+@test
+fn test_a_rate_in_whole_hertz_is_rounded_and_at_least_one() [io, hw]
+    test.assert_eq(adxl345.hz_of_mhz(98), 1)
+    test.assert_eq(adxl345.hz_of_mhz(781), 1)
+    test.assert_eq(adxl345.hz_of_mhz(1563), 2)
+    test.assert_eq(adxl345.hz_of_mhz(12500), 13)
+    test.assert_eq(adxl345.hz_of_mhz(100000), 100)
+    test.assert_eq(adxl345.hz_of_mhz(3200000), 3200)
+
+@test
+fn test_a_requested_rate_rounds_up_to_a_code() [io, hw]
+    test.assert_eq(adxl345.code_for_mhz(0), 0)
+    test.assert_eq(adxl345.code_for_mhz(98), 0)
+    test.assert_eq(adxl345.code_for_mhz(99), 1)
+    test.assert_eq(adxl345.code_for_mhz(1000), 4)
+    test.assert_eq(adxl345.code_for_mhz(100000), 10)
+    test.assert_eq(adxl345.code_for_mhz(100001), 11)
+    test.assert_eq(adxl345.code_for_mhz(3200000), 15)
+    test.assert_eq(adxl345.code_for_mhz(9999999), 15)
+
+@test
+fn test_low_power_codes_are_12_5_to_400_hz() [io, hw]
+    test.assert(not adxl345.low_power_code(6))
+    test.assert(adxl345.low_power_code(7))
+    test.assert(adxl345.low_power_code(12))
+    test.assert(not adxl345.low_power_code(13))
+
+// ── Samples ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_sample_is_one_burst_of_seven_registers_from_data_format() [io, hw]
+    let c = chip()
+    c.regs.insert(0x31, 0x08)
+    put_raw(c, 256, 0, 0)
+    let d = i2c_dut(c)
+    test.assert_eq(x_of(adxl345.sample_read(d)), 1000)
+    log_is(c, [2, 0x53, 0x31, 7, -1])
+
+@test
+fn test_a_sample_over_spi_is_the_same_burst() [io, hw]
+    let c = chip()
+    c.regs.insert(0x31, 0x08)
+    put_raw(c, 256, 0, -256)
+    let d = spi_dut(c)
+    let s = adxl345.sample_read(d)
+    test.assert_eq(x_of(s), 1000)
+    test.assert_eq(z_of(s), -1000)
+    log_is(c, spi_read_log(0xF1, 7))
+
+@test
+fn test_no_part_gives_no_sample_and_is_never_ready() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = i2c_dut(c)
+    test.assert(adxl345.sample_read(d) == None)
+    test.assert(not adxl345.sample_ready(d))
+
+@test
+fn test_ready_is_the_data_ready_bit_of_int_source() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(not adxl345.sample_ready(d))
+    log_is(c, [2, 0x53, 0x30, 1, -1])
+    c.st.insert(41, 1)
+    test.assert(adxl345.sample_ready(d))
+    // A read of the data registers clears it.
+    let _ = adxl345.sample_read(d)
+    test.assert(not adxl345.sample_ready(d))
+
+@test
+fn test_reading_int_source_for_ready_clears_the_latched_flags() [io, hw]
+    // The reason the sheet's other flags are read with `int_source`.
+    let c = chip()
+    let d = i2c_dut(c)
+    c.st.insert(40, 0x40)
+    test.assert(not adxl345.sample_ready(d))
+    test.assert_eq(adxl345.int_source(d), 0)
+    c.st.insert(40, 0x48)
+    test.assert_eq(adxl345.int_source(d), 0x48)
+    test.assert_eq(adxl345.int_source(d), 0)
+    c.st.insert(4, 0)
+    test.assert_eq(adxl345.int_source(d), -1)
+
+@test
+fn test_the_range_is_changed_without_touching_the_other_bits() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x31, 0x08)
+    test.assert(adxl345.range_write(d, AccelRange8g))
+    test.assert_eq(reg_of(c, 0x31), 0x0A)
+    test.assert(adxl345.range_read(d) == AccelRange8g)
+    test.assert(adxl345.range_write(d, AccelRange2g))
+    test.assert_eq(reg_of(c, 0x31), 0x08)
+    c.regs.insert(0x31, 0x24)
+    test.assert(adxl345.range_write(d, AccelRange16g))
+    test.assert_eq(reg_of(c, 0x31), 0x27)
+
+@test
+fn test_full_resolution_and_justify_are_set_and_cleared_alone() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x31, 0x01)
+    test.assert(adxl345.full_res_write(d, true))
+    test.assert_eq(reg_of(c, 0x31), 0x09)
+    test.assert(adxl345.justify_write(d, true))
+    test.assert_eq(reg_of(c, 0x31), 0x0D)
+    test.assert(adxl345.full_res_write(d, false))
+    test.assert_eq(reg_of(c, 0x31), 0x05)
+    test.assert(adxl345.justify_write(d, false))
+    test.assert_eq(reg_of(c, 0x31), 0x01)
+
+// ── The rate and low-power mode ──────────────────────────────────────
+
+@test
+fn test_the_rate_is_read_from_bw_rate() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(adxl345.rate_read(d), 100000)
+    c.regs.insert(0x2C, 0x1B)
+    test.assert_eq(adxl345.rate_read(d), 200000)
+    c.st.insert(4, 0)
+    test.assert_eq(adxl345.rate_read(d), 0)
+
+@test
+fn test_a_new_rate_keeps_low_power_only_where_it_is_allowed() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x2C, 0x1A)
+    // 200 Hz keeps LOW_POWER.
+    test.assert_eq(adxl345.rate_write(d, 150000), 200000)
+    test.assert_eq(reg_of(c, 0x2C), 0x1B)
+    // 800 Hz is outside low-power mode's range, so the bit goes.
+    test.assert_eq(adxl345.rate_write(d, 500000), 800000)
+    test.assert_eq(reg_of(c, 0x2C), 0x0D)
+    // Without the bit, it stays off.
+    test.assert_eq(adxl345.rate_write(d, 50000), 50000)
+    test.assert_eq(reg_of(c, 0x2C), 0x09)
+
+@test
+fn test_a_rate_that_is_not_taken_answers_zero() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.ro.insert(0x2C, 1)
+    test.assert_eq(adxl345.rate_write(d, 50000), 0)
+    c.st.insert(4, 0)
+    test.assert_eq(adxl345.rate_write(d, 50000), 0)
+
+@test
+fn test_low_power_mode_is_refused_outside_its_rates() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(not adxl345.low_power_read(d))
+    // 100 Hz is code 10: allowed.
+    test.assert(adxl345.low_power_write(d, true))
+    test.assert_eq(reg_of(c, 0x2C), 0x1A)
+    test.assert(adxl345.low_power_read(d))
+    test.assert(adxl345.low_power_write(d, false))
+    test.assert_eq(reg_of(c, 0x2C), 0x0A)
+    // 3200 Hz is code 15: refused, and nothing is written.
+    c.regs.insert(0x2C, 0x0F)
+    log_clear(c)
+    test.assert(not adxl345.low_power_write(d, true))
+    log_is(c, [2, 0x53, 0x2C, 1, -1])
+    // Turning it off needs no check.
+    test.assert(adxl345.low_power_write(d, false))
+    c.st.insert(4, 0)
+    test.assert(not adxl345.low_power_write(d, true))
+    test.assert(not adxl345.low_power_read(d))
+
+// ── The FIFO ─────────────────────────────────────────────────────────
+
+@test
+fn test_fifo_start_writes_stream_mode_then_routes_the_watermark() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x2E, 0x80)
+    test.assert(adxl345.fifo_start(d, 16))
+    test.assert_eq(reg_of(c, 0x38), 0x90)
+    test.assert_eq(reg_of(c, 0x2E), 0x02)
+    log_clear(c)
+    test.assert(adxl345.fifo_start(d, 0))
+    test.assert_eq(reg_of(c, 0x38), 0x81)
+    test.assert(adxl345.fifo_start(d, 99))
+    test.assert_eq(reg_of(c, 0x38), 0x9F)
+    // The FIFO_CTL write comes before the interrupt enable.
+    log_clear(c)
+    test.assert(adxl345.fifo_start(d, 5))
+    log_is(c, [1, 0x53, 0x38, 0x85, -1, 2, 0x53, 0x38, 1, -1, 2, 0x53, 0x2E, 1, -1, 1, 0x53, 0x2E, 0x02, -1, 2, 0x53, 0x2E, 1, -1])
+
+@test
+fn test_fifo_stop_empties_the_fifo_and_restores_the_data_ready() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x38, 0x95)
+    c.regs.insert(0x2E, 0x02)
+    test.assert(adxl345.fifo_stop(d))
+    test.assert_eq(reg_of(c, 0x38), 0)
+    test.assert_eq(reg_of(c, 0x2E), 0x80)
+
+@test
+fn test_the_fifo_refusals() [io, hw]
+    let c = chip()
+    c.regs.insert(0x38, 0x80)
+    c.ro.insert(0x38, 1)
+    test.assert(not adxl345.fifo_start(i2c_dut(c), 8))
+    test.assert(not adxl345.fifo_stop(i2c_dut(c)))
+    let e = chip()
+    e.ro.insert(0x2E, 1)
+    test.assert(not adxl345.fifo_start(i2c_dut(e), 8))
+    test.assert(not adxl345.fifo_stop(i2c_dut(e)))
+
+@test
+fn test_the_fifo_count_is_capped_at_32_of_the_33_the_part_shows() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(adxl345.fifo_count(d), 0)
+    c.regs.insert(0x38, 0x80)
+    for i in 0..33
+        fifo_push(c, i, 0, 0)
+    test.assert_eq(adxl345.fifo_count(d), 32)
+    let e = chip()
+    e.regs.insert(0x38, 0x80)
+    fifo_push(e, 1, 2, 3)
+    fifo_push(e, 4, 5, 6)
+    test.assert_eq(adxl345.fifo_count(i2c_dut(e)), 2)
+    e.st.insert(4, 0)
+    test.assert_eq(adxl345.fifo_count(i2c_dut(e)), 0)
+
+@test
+fn test_the_fifo_is_read_oldest_first_at_the_present_format() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x31, 0x08)
+    c.regs.insert(0x38, 0x80)
+    fifo_push(c, 256, 0, 0)
+    fifo_push(c, 0, 256, 0)
+    fifo_push(c, 0, 0, -256)
+    var out: Vec[AccelMilliG; 32] = Vec.new()
+    test.assert_eq(adxl345.fifo_read(d, var out), 3)
+    test.assert_eq(out.len(), 3)
+    test.assert_eq(out[0].x, 1000)
+    test.assert_eq(out[1].y, 1000)
+    test.assert_eq(out[2].z, -1000)
+    test.assert_eq(adxl345.fifo_count(d), 0)
+
+@test
+fn test_each_fifo_sample_is_one_burst_of_the_six_data_registers() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x38, 0x80)
+    fifo_push(c, 1, 2, 3)
+    fifo_push(c, 4, 5, 6)
+    var out: Vec[AccelMilliG; 32] = Vec.new()
+    log_clear(c)
+    test.assert_eq(adxl345.fifo_read(d, var out), 2)
+    log_is(c, [2, 0x53, 0x39, 1, -1, 2, 0x53, 0x31, 1, -1, 2, 0x53, 0x32, 6, -1, 2, 0x53, 0x32, 6, -1])
+
+@test
+fn test_an_empty_fifo_or_a_silent_part_moves_nothing() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    var out: Vec[AccelMilliG; 32] = Vec.new()
+    let _ = out.push(AccelMilliG { x: 9, y: 9, z: 9 })
+    test.assert_eq(adxl345.fifo_read(d, var out), 0)
+    test.assert_eq(out.len(), 0)
+    // A part that answers the count and then goes quiet.
+    let e = chip()
+    e.regs.insert(0x38, 0x80)
+    fifo_push(e, 1, 2, 3)
+    e.regs.insert(0x31, 0x08)
+    let f = flaky(e, 0, 0)
+    f.reads.insert(1, 1)
+    test.assert_eq(adxl345.fifo_read(f, var out), 0)
+    // A format that cannot be read.
+    let g = chip()
+    g.regs.insert(0x38, 0x80)
+    fifo_push(g, 1, 2, 3)
+    let h = flaky(g, 0, 0)
+    h.reads.insert(2, 1)
+    test.assert_eq(adxl345.fifo_read(h, var out), 0)
+
+@test
+fn test_a_fifo_that_stops_answering_part_way_gives_what_it_moved() [io, hw]
+    let c = chip()
+    c.regs.insert(0x38, 0x80)
+    c.regs.insert(0x31, 0x08)
+    fifo_push(c, 256, 0, 0)
+    fifo_push(c, 256, 0, 0)
+    fifo_push(c, 256, 0, 0)
+    let f = flaky(c, 0, 0)
+    f.reads.insert(1, 1)
+    f.reads.insert(0, 2)
+    var out: Vec[AccelMilliG; 32] = Vec.new()
+    test.assert_eq(adxl345.fifo_read(f, var out), 2)
+    test.assert_eq(out.len(), 2)
+
+// ── The thresholds and times ─────────────────────────────────────────
+
+@test
+fn test_a_threshold_is_a_count_of_62_5_mg_held_to_1_to_255() [io, hw]
+    test.assert_eq(adxl345.thresh_of_mg(1000), 16)
+    test.assert_eq(adxl345.thresh_of_mg(16000), 256 - 1)
+    test.assert_eq(adxl345.thresh_of_mg(15937), 255)
+    test.assert_eq(adxl345.thresh_of_mg(600), 10)
+    test.assert_eq(adxl345.thresh_of_mg(300), 5)
+    test.assert_eq(adxl345.thresh_of_mg(0), 1)
+    test.assert_eq(adxl345.thresh_of_mg(-5), 1)
+    test.assert_eq(adxl345.thresh_of_mg(31), 1)
+    test.assert_eq(adxl345.thresh_of_mg(32), 1)
+    test.assert_eq(adxl345.thresh_of_mg(94), 2)
+
+@test
+fn test_a_time_is_a_count_of_its_unit_held_to_0_to_255() [io, hw]
+    test.assert_eq(adxl345.count_of_us(6250, 625), 10)
+    test.assert_eq(adxl345.count_of_us(0, 625), 0)
+    test.assert_eq(adxl345.count_of_us(-1, 625), 0)
+    test.assert_eq(adxl345.count_of_us(-1250, 625), 0)
+    test.assert_eq(adxl345.count_of_us(1000000, 625), 255)
+    test.assert_eq(adxl345.count_of_us(12500, 1250), 10)
+    test.assert_eq(adxl345.time_ff_of_ms(100), 20)
+    test.assert_eq(adxl345.time_ff_of_ms(1), 1)
+    test.assert_eq(adxl345.time_ff_of_ms(5000), 255)
+    test.assert_eq(adxl345.time_inact_of_s(30), 30)
+    test.assert_eq(adxl345.time_inact_of_s(-1), 0)
+    test.assert_eq(adxl345.time_inact_of_s(300), 255)
+
+// ── The detectors ────────────────────────────────────────────────────
+
+@test
+fn test_tap_detection_writes_the_threshold_times_and_axes() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(adxl345.tap_config(d, 2000, 6250, 25000, 100000, adxl345.TAP_X | adxl345.TAP_Z))
+    test.assert_eq(reg_of(c, 0x1D), 32)
+    test.assert_eq(reg_of(c, 0x21), 10)
+    test.assert_eq(reg_of(c, 0x22), 20)
+    test.assert_eq(reg_of(c, 0x23), 80)
+    test.assert_eq(reg_of(c, 0x2A), 0x05)
+    // Suppress rides in the same register; bits above it are dropped.
+    test.assert(adxl345.tap_config(d, 2000, 0, 0, 0, 0xF8 | adxl345.TAP_SUPPRESS))
+    test.assert_eq(reg_of(c, 0x2A), 0x08)
+    test.assert_eq(reg_of(c, 0x21), 0)
+
+@test
+fn test_tap_detection_stops_at_the_first_register_the_part_refuses() [io, hw]
+    for r in [0x1D, 0x21, 0x22, 0x23, 0x2A]
+        let c = chip()
+        c.ro.insert(r, 1)
+        test.assert(not adxl345.tap_config(i2c_dut(c), 2000, 6250, 25000, 100000, 7))
+
+@test
+fn test_activity_and_inactivity_share_act_inact_ctl_by_nibble() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(adxl345.activity_config(d, 1000, adxl345.AXES_X | adxl345.AXES_Y))
+    test.assert_eq(reg_of(c, 0x24), 16)
+    test.assert_eq(reg_of(c, 0x27), 0x60)
+    test.assert(adxl345.inactivity_config(d, 250, 30, adxl345.AXES_AC | adxl345.AXES_Z))
+    test.assert_eq(reg_of(c, 0x25), 4)
+    test.assert_eq(reg_of(c, 0x26), 30)
+    test.assert_eq(reg_of(c, 0x27), 0x69)
+    // The activity half is written again without touching the other.
+    test.assert(adxl345.activity_config(d, 2000, adxl345.AXES_AC | adxl345.AXES_X | adxl345.AXES_Y | adxl345.AXES_Z))
+    test.assert_eq(reg_of(c, 0x27), 0xF9)
+
+@test
+fn test_activity_and_inactivity_refusals() [io, hw]
+    for r in [0x24, 0x27]
+        let c = chip()
+        c.ro.insert(r, 1)
+        test.assert(not adxl345.activity_config(i2c_dut(c), 1000, 7))
+    for r in [0x25, 0x26, 0x27]
+        let c = chip()
+        c.ro.insert(r, 1)
+        test.assert(not adxl345.inactivity_config(i2c_dut(c), 1000, 5, 7))
+
+@test
+fn test_free_fall_detection_writes_the_threshold_and_time() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(adxl345.free_fall_config(d, 350, 100))
+    test.assert_eq(reg_of(c, 0x28), 6)
+    test.assert_eq(reg_of(c, 0x29), 20)
+    let e = chip()
+    e.ro.insert(0x28, 1)
+    test.assert(not adxl345.free_fall_config(i2c_dut(e), 350, 100))
+    let f = chip()
+    f.ro.insert(0x29, 1)
+    test.assert(not adxl345.free_fall_config(i2c_dut(f), 350, 100))
+
+@test
+fn test_the_interrupts_are_off_while_they_are_routed_then_cleared_and_on() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x31, 0x08)
+    c.st.insert(40, 0x7F)
+    test.assert(adxl345.int_config(d, adxl345.INT_SINGLE_TAP | adxl345.INT_FREE_FALL, adxl345.INT_FREE_FALL, true))
+    test.assert_eq(reg_of(c, 0x2E), 0x44)
+    test.assert_eq(reg_of(c, 0x2F), 0x04)
+    test.assert_eq(reg_of(c, 0x31), 0x28)
+    test.assert_eq(at(c.st, 40), 0)
+    test.assert(adxl345.int_config(d, adxl345.INT_DATA_READY, 0, false))
+    test.assert_eq(reg_of(c, 0x2E), 0x80)
+    test.assert_eq(reg_of(c, 0x2F), 0x00)
+    test.assert_eq(reg_of(c, 0x31), 0x08)
+
+@test
+fn test_the_interrupt_writes_come_in_the_order_the_sheet_advises() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x2E, 0x80)
+    log_clear(c)
+    test.assert(adxl345.int_config(d, 0x40, 0x00, false))
+    // Disable (write, read back), map, polarity (read, write, read
+    // back), INT_SOURCE read, enable (write, read back).
+    log_is(c, [1, 0x53, 0x2E, 0x00, -1, 2, 0x53, 0x2E, 1, -1,
+               1, 0x53, 0x2F, 0x00, -1, 2, 0x53, 0x2F, 1, -1,
+               2, 0x53, 0x31, 1, -1, 1, 0x53, 0x31, 0x00, -1, 2, 0x53, 0x31, 1, -1,
+               2, 0x53, 0x30, 1, -1,
+               1, 0x53, 0x2E, 0x40, -1, 2, 0x53, 0x2E, 1, -1])
+
+@test
+fn test_the_interrupt_refusals() [io, hw]
+    // Each register is read-only in turn, holding a value the write
+    // would change.
+    for r in [0x2E, 0x2F, 0x31]
+        let c = chip()
+        c.regs.insert(0x2E, 0x80)
+        c.ro.insert(r, 1)
+        test.assert(not adxl345.int_config(i2c_dut(c), 0x80, 0x04, true))
+    let f = flaky(chip(), 0x2E, 2)
+    test.assert(not adxl345.int_config(f, 0x80, 0, false))
+
+@test
+fn test_the_tap_status_is_read_from_act_tap_status() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x2B, 0x24)
+    test.assert_eq(adxl345.act_tap_status(d), 0x24)
+    c.st.insert(4, 0)
+    test.assert_eq(adxl345.act_tap_status(d), -1)
+
+// ── Self-test ────────────────────────────────────────────────────────
+
+fn self_test_chip() -> Chip
+    let c = chip()
+    c.st.insert(42, 1)
+    c.st.insert(30, 200)
+    c.st.insert(31, -200)
+    c.st.insert(32, 300)
+    // The part reads 1 g on Z, in the 256-counts-per-g of full
+    // resolution.
+    put_raw(c, 0, 0, 256)
+    c.regs.insert(0x2D, 0x08)
+    c
+
+@test
+fn test_the_self_test_is_the_change_the_force_makes_in_milli_g() [io, hw]
+    let c = self_test_chip()
+    let d = i2c_dut(c)
+    // 200 counts on X at 3.9 mg are 781 mg, 300 on Z are 1171 mg.
+    let r = adxl345.self_test_delta(d)
+    test.assert_eq(x_of(r), 781)
+    test.assert_eq(y_of(r), -781)
+    test.assert_eq(z_of(r), 1171)
+    match r
+        Some(delta) => test.assert(adxl345.self_test_within(delta, 1000, 1000))
+        None        => test.assert(false)
+
+@test
+fn test_the_self_test_puts_back_the_settings_it_changed() [io, hw]
+    let c = self_test_chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x2C, 0x1B)
+    c.regs.insert(0x31, 0x25)
+    c.regs.insert(0x2D, 0x00)
+    let r = adxl345.self_test_delta(d)
+    test.assert(r != None)
+    test.assert_eq(reg_of(c, 0x2C), 0x1B)
+    test.assert_eq(reg_of(c, 0x31), 0x25)
+    test.assert_eq(reg_of(c, 0x2D), 0x00)
+
+@test
+fn test_the_self_test_runs_at_100_hz_full_resolution_and_16_g() [io, hw]
+    // The sheet asks for 100 Hz, normal power, full resolution at ±16 g
+    // (p. 31): the first write after the three reads is BW_RATE.
+    let c = self_test_chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x31, 0x00)
+    log_clear(c)
+    let _ = adxl345.self_test_delta(d)
+    test.assert_eq(at(c.log, 15), 1)
+    test.assert_eq(at(c.log, 17), 0x2C)
+    test.assert_eq(at(c.log, 18), 0x0A)
+
+@test
+fn test_the_self_test_gives_nothing_when_no_sample_comes() [io, hw]
+    let c = self_test_chip()
+    c.st.insert(42, 0)
+    test.assert(adxl345.self_test_delta(i2c_dut(c)) == None)
+    // The settings are put back all the same.
+    test.assert_eq(reg_of(c, 0x31), 0x00)
+
+@test
+fn test_the_self_test_that_loses_the_second_run_of_samples_gives_nothing() [io, hw]
+    let c = self_test_chip()
+    c.st.insert(45, 1)
+    // 14 samples are the first run: four settle and ten average.
+    c.st.insert(44, 14)
+    test.assert(adxl345.self_test_delta(i2c_dut(c)) == None)
+    test.assert_eq(reg_of(c, 0x31), 0x00)
+
+@test
+fn test_the_self_test_that_cannot_be_set_up_gives_nothing() [io, hw]
+    let c = self_test_chip()
+    c.regs.insert(0x2C, 0x0B)
+    c.ro.insert(0x2C, 1)
+    test.assert(adxl345.self_test_delta(i2c_dut(c)) == None)
+    let e = self_test_chip()
+    let f = flaky(e, 0x31, 2)
+    test.assert(adxl345.self_test_delta(f) == None)
+    let g = self_test_chip()
+    let h = flaky(g, 0x31, 1)
+    test.assert(adxl345.self_test_delta(h) == None)
+    let s = chip()
+    s.st.insert(4, 0)
+    test.assert(adxl345.self_test_delta(i2c_dut(s)) == None)
+
+@test
+fn test_a_silent_part_during_the_self_test_gives_nothing() [io, hw]
+    // A part that answers the readiness but not the data.
+    let c = self_test_chip()
+    let f = flaky(c, 0, 0)
+    f.reads.insert(1, 1)
+    test.assert(adxl345.self_test_delta(f) == None)
+
+@test
+fn test_the_self_test_window_is_table_1_scaled_by_the_supply() [io, hw]
+    let ok = AccelMilliG { x: 781, y: -781, z: 1171 }
+    test.assert(adxl345.self_test_within(ok, 1000, 1000))
+    // At 2.0 V Table 14 scales X and Y by 0.64 and Z by 0.8: 128 mg is
+    // the lowest X change that passes.
+    test.assert(adxl345.self_test_within(AccelMilliG { x: 128, y: -128, z: 240 }, 640, 800))
+    test.assert(not adxl345.self_test_within(AccelMilliG { x: 127, y: -128, z: 240 }, 640, 800))
+    test.assert(not adxl345.self_test_within(AccelMilliG { x: 2200, y: -781, z: 1171 }, 1000, 1000))
+    test.assert(not adxl345.self_test_within(AccelMilliG { x: 781, y: 781, z: 1171 }, 1000, 1000))
+    test.assert(not adxl345.self_test_within(AccelMilliG { x: 781, y: -150, z: 1171 }, 1000, 1000))
+    test.assert(not adxl345.self_test_within(AccelMilliG { x: 781, y: -2200, z: 1171 }, 1000, 1000))
+    test.assert(not adxl345.self_test_within(AccelMilliG { x: 781, y: -781, z: 100 }, 1000, 1000))
+    test.assert(not adxl345.self_test_within(AccelMilliG { x: 781, y: -781, z: 3500 }, 1000, 1000))
+
+// ── Bring-up ─────────────────────────────────────────────────────────
+
+@test
+fn test_begin_brings_the_part_up_over_i2c() [io, hw]
+    let c = chip()
+    // Stale settings from a previous run of the program.
+    c.regs.insert(0x2D, 0x0C)
+    c.regs.insert(0x2E, 0xFF)
+    c.regs.insert(0x38, 0xC5)
+    c.regs.insert(0x27, 0xFF)
+    c.regs.insert(0x21, 9)
+    c.regs.insert(0x2A, 7)
+    c.regs.insert(0x2F, 0xFF)
+    c.regs.insert(0x31, 0xAF)
+    c.regs.insert(0x2C, 0x1F)
+    c.regs.insert(0x1E, 0x12)
+    test.assert(adxl345.start(i2c_dut(c)))
+    test.assert_eq(reg_of(c, 0x2D), 0x08)
+    test.assert_eq(reg_of(c, 0x2E), 0x80)
+    test.assert_eq(reg_of(c, 0x2F), 0x00)
+    test.assert_eq(reg_of(c, 0x31), 0x08)
+    test.assert_eq(reg_of(c, 0x2C), 0x0A)
+    test.assert_eq(reg_of(c, 0x38), 0x00)
+    test.assert_eq(reg_of(c, 0x27), 0x00)
+    test.assert_eq(reg_of(c, 0x21), 0x00)
+    test.assert_eq(reg_of(c, 0x2A), 0x00)
+    // The offset is a calibration and is kept.
+    test.assert_eq(reg_of(c, 0x1E), 0x12)
+
+@test
+fn test_begin_leaves_measurement_for_last_and_the_interrupt_after_the_map() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(d.setup())
+    log_clear(c)
+    test.assert(adxl345.start(d))
+    // The first transactions: DEVID, then standby.
+    test.assert_eq(at(c.log, 0), 2)
+    test.assert_eq(at(c.log, 2), 0x00)
+    test.assert_eq(at(c.log, 5), 1)
+    test.assert_eq(at(c.log, 7), 0x2D)
+    test.assert_eq(at(c.log, 8), 0x00)
+    // The last write is POWER_CTL with Measure set.
+    let n = at(c.st, 99)
+    test.assert_eq(at(c.log, n - 10), 1)
+    test.assert_eq(at(c.log, n - 8), 0x2D)
+    test.assert_eq(at(c.log, n - 7), 0x08)
+
+@test
+fn test_begin_brings_the_part_up_over_spi() [io, hw]
+    let c = chip()
+    test.assert(adxl345.start(spi_dut(c)))
+    test.assert_eq(reg_of(c, 0x2D), 0x08)
+    test.assert_eq(reg_of(c, 0x31), 0x08)
+    test.assert_eq(at(c.st, 21), 3)
+
+@test
+fn test_begin_refuses_a_part_that_is_not_there_or_not_an_adxl345() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    test.assert(not adxl345.start(i2c_dut(c)))
+    let d = chip()
+    d.regs.insert(0x00, 0xE6)
+    test.assert(not adxl345.start(i2c_dut(d)))
+    log_clear(d)
+    test.assert(not adxl345.start(i2c_dut(d)))
+    log_is(d, [2, 0x53, 0x00, 1, -1])
+    let e = chip()
+    test.assert(not adxl345.start(I2cDut { bus: FakeI2c { c: e }, pins: pins(e), w: dev_bus.wiring_spi(0, 67) }))
+
+@test
+fn test_begin_refuses_a_register_that_does_not_hold_what_was_written() [io, hw]
+    // The writes of `start` in order, as (register, which write of it).
+    let regs = [0x2D, 0x2E, 0x38, 0x27, 0x21, 0x22, 0x23, 0x2A, 0x2F, 0x31, 0x2C, 0x2E, 0x2D]
+    let nth = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2]
+    for i in 0..regs.len()
+        let f = flaky(chip(), regs[i], nth[i])
+        test.assert(not adxl345.start(f))
+        test.assert(at(f.seen, regs[i]) >= nth[i])
+
+// ── The types over the host's board handles ──────────────────────────
+//
+// The host's handles are absent hardware: every transfer is refused, so
+// each method answers its "no part" value.  This runs the lines of the
+// two types that forward to the functions above.
+
+@test
+fn test_the_i2c_type_over_absent_hardware() [io, hw]
+    let w = dev_bus.wiring_i2c(0, 0x53)
+    let p = Adxl345.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, w)
+    test.assert(not p.begin())
+    test.assert(p.reg(0x00) == None)
+    test.assert(not p.set_reg(0x2C, 1))
+    test.assert(not p.set_full_res(true))
+    test.assert(not p.set_justify(true))
+    test.assert_eq(p.rate_mhz(), 0)
+    test.assert_eq(p.set_rate_mhz(100000), 0)
+    test.assert(not p.low_power())
+    test.assert(not p.set_low_power(true))
+    test.assert(not p.fifo_begin(10))
+    test.assert(not p.fifo_end())
+    test.assert(not p.configure_tap(2000, 6250, 25000, 100000, 7))
+    test.assert(not p.configure_activity(1000, 7))
+    test.assert(not p.configure_inactivity(1000, 5, 7))
+    test.assert(not p.configure_free_fall(350, 100))
+    test.assert(not p.configure_interrupts(0x80, 0, false))
+    test.assert_eq(p.interrupt_flags(), -1)
+    test.assert_eq(p.tap_status(), -1)
+    test.assert(p.self_test() == None)
+    test.assert_eq(p.irq_level(), -1)
+    test.assert(p.accel_read() == None)
+    test.assert(not p.accel_ready())
+    test.assert(p.accel_range() == AccelRange2g)
+    test.assert(not p.accel_set_range(AccelRange4g))
+    test.assert_eq(p.accel_rate_hz(), 0)
+    test.assert_eq(p.accel_set_rate_hz(100), 0)
+    test.assert_eq(p.accel_fifo_count(), 0)
+    var out: Vec[AccelMilliG; 32] = Vec.new()
+    test.assert_eq(p.accel_fifo_read(var out), 0)
+    test.assert(p.device_id() == None)
+
+@test
+fn test_the_spi_type_over_absent_hardware() [io, hw]
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    let p = Adxl345Spi.attach(BoardSpi { id: 0 }, BoardGpio { id: 0 }, w)
+    test.assert(not p.begin())
+    test.assert(p.reg(0x00) == None)
+    test.assert(not p.set_reg(0x2C, 1))
+    test.assert(not p.set_full_res(true))
+    test.assert(not p.set_justify(true))
+    test.assert_eq(p.rate_mhz(), 0)
+    test.assert_eq(p.set_rate_mhz(100000), 0)
+    test.assert(not p.low_power())
+    test.assert(not p.set_low_power(true))
+    test.assert(not p.fifo_begin(10))
+    test.assert(not p.fifo_end())
+    test.assert(not p.configure_tap(2000, 6250, 25000, 100000, 7))
+    test.assert(not p.configure_activity(1000, 7))
+    test.assert(not p.configure_inactivity(1000, 5, 7))
+    test.assert(not p.configure_free_fall(350, 100))
+    test.assert(not p.configure_interrupts(0x80, 0, false))
+    test.assert_eq(p.interrupt_flags(), -1)
+    test.assert_eq(p.tap_status(), -1)
+    test.assert(p.self_test() == None)
+    test.assert_eq(p.irq_level(), -1)
+    test.assert(p.accel_read() == None)
+    test.assert(not p.accel_ready())
+    test.assert(p.accel_range() == AccelRange2g)
+    test.assert(not p.accel_set_range(AccelRange4g))
+    test.assert_eq(p.accel_rate_hz(), 0)
+    test.assert_eq(p.accel_set_rate_hz(100), 0)
+    test.assert_eq(p.accel_fifo_count(), 0)
+    var out: Vec[AccelMilliG; 32] = Vec.new()
+    test.assert_eq(p.accel_fifo_read(var out), 0)
+    test.assert(p.device_id() == None)
+
+@test
+fn test_the_trait_rate_is_whole_hertz() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(adxl345.rate_hz_read(d), 100)
+    test.assert_eq(adxl345.rate_hz_write(d, 12), 13)
+    test.assert_eq(adxl345.rate_hz_read(d), 13)
+    test.assert_eq(adxl345.rate_hz_write(d, 1), 2)
+    test.assert_eq(adxl345.rate_hz_write(d, 3200), 3200)
+    c.st.insert(4, 0)
+    test.assert_eq(adxl345.rate_hz_read(d), 0)
+    test.assert_eq(adxl345.rate_hz_write(d, 100), 0)

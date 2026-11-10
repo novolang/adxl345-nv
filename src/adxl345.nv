@@ -193,8 +193,8 @@ let FIFO_DEPTH = 32
 let RATE_100 = 10
 
 // The clocks `setup` asks for: I2C fast mode, and SPI at 4 MHz in mode 3.
-let I2C_HZ = 400000
-let SPI_HZ = 4000000
+let I2C_HZ   = 400000
+let SPI_HZ   = 4000000
 let SPI_MODE = 3
 
 // The most polls of the data-ready flag a self-test makes for one
@@ -202,7 +202,7 @@ let SPI_MODE = 3
 // 100 us.
 let SELF_TEST_POLLS = 4000
 // Samples the self-test lets settle after a change, and averages (p. 31).
-let SELF_TEST_SETTLE = 4
+let SELF_TEST_SETTLE  = 4
 let SELF_TEST_AVERAGE = 10
 
 // A bus the part is on.  `setup` makes the bus and the pins ready and
@@ -243,8 +243,8 @@ pub fn i2c_write<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, v: Int) -> Bool [
 // Reads `n` registers from `reg` into `dst` in one SPI transaction:
 // whether it ran, which is whether the wiring has a chip select.  An
 // absent part reads 0xFF, which the callers check for.
-pub fn spi_read_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int,
-                                            n: Int, var dst: DevBytes) -> Bool [hw]
+pub fn spi_read_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int, n: Int,
+                                            var dst: DevBytes) -> Bool [hw]
     var tx: DevBytes = Vec.new()
     let _ = tx.push(spi_cmd_of(reg, n) as u8)
     dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, n, var dst)
@@ -612,8 +612,8 @@ pub fn time_inact_of_s(s: Int) -> Int
 // and TAP_AXES' byte, `TAP_X`, `TAP_Y` and `TAP_Z` with `TAP_SUPPRESS`.  A
 // zero duration disables the single tap; a zero latency or window
 // disables the double tap.  Whether the part took every setting.
-pub fn tap_config<P: Adxl345Port>(p: P, thresh_mg: Int, dur_us: Int, latent_us: Int,
-                                  window_us: Int, axes: Int) -> Bool [hw]
+pub fn tap_config<P: Adxl345Port>(p: P, thresh_mg: Int, dur_us: Int, latent_us: Int, window_us: Int,
+                                  axes: Int) -> Bool [hw]
     if not reg_write(p, THRESH_TAP, thresh_of_mg(thresh_mg))
         return false
     if not reg_write(p, DUR, count_of_us(dur_us, 625))
@@ -636,8 +636,7 @@ pub fn activity_config<P: Adxl345Port>(p: P, thresh_mg: Int, axes: Int) -> Bool 
 // seconds the acceleration stays under it, and the axes as the nibble
 // `AXES_AC`, `AXES_X`, `AXES_Y` and `AXES_Z` make.  The activity half of
 // ACT_INACT_CTL is kept.  Whether the part took it.
-pub fn inactivity_config<P: Adxl345Port>(p: P, thresh_mg: Int, time_s: Int,
-                                         axes: Int) -> Bool [hw]
+pub fn inactivity_config<P: Adxl345Port>(p: P, thresh_mg: Int, time_s: Int, axes: Int) -> Bool [hw]
     if not reg_write(p, THRESH_INACT, thresh_of_mg(thresh_mg))
         return false
     if not reg_write(p, TIME_INACT, time_inact_of_s(time_s))
@@ -698,7 +697,7 @@ fn settled_mean<P: Adxl345Port>(p: P) -> ?AccelMilliG [hw]
     var sx = 0
     var sy = 0
     var sz = 0
-    for i in 0..(SELF_TEST_SETTLE + SELF_TEST_AVERAGE)
+    for i in 0..SELF_TEST_SETTLE + SELF_TEST_AVERAGE
         if not wait_sample(p)
             return None
         let Some(s) = sample_read(p) else return None

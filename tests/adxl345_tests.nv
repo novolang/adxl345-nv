@@ -46,7 +46,11 @@ fn at(m: HashMap<Int, Int>, k: Int) -> Int
 
 // The chip with DEVID and the reset values in place.
 fn chip() -> Chip
-    let c = Chip { regs: HashMap.new(), st: HashMap.new(), ro: HashMap.new(), log: HashMap.new(), fifo: HashMap.new() }
+    let c = Chip { regs: HashMap.new(),
+        st: HashMap.new(),
+        ro: HashMap.new(),
+        log: HashMap.new(),
+        fifo: HashMap.new() }
     c.regs.insert(0x00, 0xE5)
     c.regs.insert(0x2C, 0x0A)
     c.st.insert(4, 1)
@@ -291,7 +295,7 @@ impl Adxl345Port for Flaky
         if reg == 0x31 and n == 1 and at(self.reads, 2) == 1
             dst.clear()
             return false
-        if ((reg == 0x32 and n == 6) or (reg == 0x31 and n == 7)) and at(self.reads, 1) == 1
+        if (reg == 0x32 and n == 6 or reg == 0x31 and n == 7) and at(self.reads, 1) == 1
             if at(self.reads, 0) == 0
                 dst.clear()
                 return false
@@ -521,7 +525,7 @@ fn test_the_identity_is_devid_on_both_buses() [io, hw]
         Some(id) =>
             test.assert_eq(id.who, 0xE5)
             test.assert(id.rev == None)
-        None => test.assert(false)
+        None     => test.assert(false)
     match adxl345.id_read(spi_dut(c))
         Some(id) => test.assert_eq(id.who, 0xE5)
         None     => test.assert(false)
@@ -830,7 +834,31 @@ fn test_fifo_start_writes_stream_mode_then_routes_the_watermark() [io, hw]
     // The FIFO_CTL write comes before the interrupt enable.
     log_clear(c)
     test.assert(adxl345.fifo_start(d, 5))
-    log_is(c, [1, 0x53, 0x38, 0x85, -1, 2, 0x53, 0x38, 1, -1, 2, 0x53, 0x2E, 1, -1, 1, 0x53, 0x2E, 0x02, -1, 2, 0x53, 0x2E, 1, -1])
+    log_is(c, [1,
+        0x53,
+        0x38,
+        0x85,
+        -1,
+        2,
+        0x53,
+        0x38,
+        1,
+        -1,
+        2,
+        0x53,
+        0x2E,
+        1,
+        -1,
+        1,
+        0x53,
+        0x2E,
+        0x02,
+        -1,
+        2,
+        0x53,
+        0x2E,
+        1,
+        -1])
 
 @test
 fn test_fifo_stop_empties_the_fifo_and_restores_the_data_ready() [io, hw]
